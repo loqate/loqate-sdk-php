@@ -13,6 +13,9 @@
             "Loqate\\ApiConnector\\": "src/"
         }
     },
+    "scripts": {
+        "test": "@php tests/no-deprecations.php"
+    },
     "authors": [
         {
             "name": "Henry Thomas"
