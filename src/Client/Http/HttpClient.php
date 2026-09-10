@@ -25,7 +25,10 @@ class HttpClient
 
         $response = curl_exec($cURLConnection);
         $response = json_decode($response, true);
-        curl_close($cURLConnection);
+        // LOQ-17709: do not restore curl_close() - deprecated from PHP 8.5, no effect since 8.0.
+        // On PHP 7 the handle is a refcounted resource, so dropping its ONLY reference frees it
+        // here; anything needing curl_getinfo() or curl_errno() must read them above this line.
+        unset($cURLConnection);
 
         if ($errorMessage = $this->searchForError($response)) {
             throw new Exception($errorMessage);
@@ -48,7 +51,10 @@ class HttpClient
 
         $response = curl_exec($cURLConnection);
         $response = json_decode($response, true);
-        curl_close($cURLConnection);
+        // LOQ-17709: do not restore curl_close() - deprecated from PHP 8.5, no effect since 8.0.
+        // On PHP 7 the handle is a refcounted resource, so dropping its ONLY reference frees it
+        // here; anything needing curl_getinfo() or curl_errno() must read them above this line.
+        unset($cURLConnection);
 
         if ($errorMessage = $this->searchForError($response)) {
             throw new Exception($errorMessage);
