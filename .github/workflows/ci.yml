@@ -1,0 +1,165 @@
+# ==============================================================================
+# CI - Test Suite
+# ==============================================================================
+# Runs the library's regression suite on every pull request and on every push to
+# master.
+#
+# There is exactly one suite here, and it is not PHPUnit:
+#
+#   tests/no-deprecations.php   A standalone script (LOQ-17709). It boots PHP's
+#                               built-in server on 127.0.0.1 as its own stub
+#                               Loqate endpoint, drives HttpClient::get() and
+#                               ::post() at it under an error handler that turns
+#                               ANY diagnostic into a failure, and asserts both
+#                               the clean path and the error-envelope throw.
+#
+# It has no dependencies (no PHPUnit, no vendor/bin, nothing in require-dev), so
+# the whole job is: install PHP with ext-curl, run the script. It is invoked
+# through `composer test` so the command in CI is the same one a developer runs
+# locally - see the "scripts" block in composer.json.
+#
+# This repo is a Composer LIBRARY published to Packagist as lqt/api-connector
+# (~50k installs, consumed by loqate-magento as "lqt/api-connector": "^1.1"). It
+# is not a deployable artifact, so there is nothing to build, package or deploy
+# here - only to prove it still behaves on every PHP a consumer might be on.
+#
+# There is no JavaScript job (unlike loqate-magento's ci.yml): this repo is PHP
+# only, src/ is five classes and zero runtime dependencies.
+# ==============================================================================
+
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+# Read-only by default. Nothing in this workflow writes to the repo; the job
+# below re-declares this explicitly so the least-privilege intent survives any
+# future job being added here.
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (PHP ${{ matrix.php-version }})
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    strategy:
+      # Keep going after one version fails - knowing it is "8.5 only" versus
+      # "everything" is the whole value of a matrix.
+      fail-fast: false
+      matrix:
+        # ----------------------------------------------------------------------
+        # Why these versions
+        # ----------------------------------------------------------------------
+        # composer.json declares "php": ">= 7.0", but the floor that actually
+        # works is 7.1: src/Utils/API.php declares `getEndpoint($key): ?string`,
+        # and nullable type hints are PHP 7.1+ syntax. On 7.0 that file is a
+        # parse error, so the published constraint has been wrong since that
+        # signature was introduced.
+        #
+        # That mismatch is PRE-EXISTING and deliberately NOT fixed here (it is a
+        # semver-visible change to a package with ~50k installs, so it belongs in
+        # its own ticket - either widen the code back to 7.0 or raise the
+        # constraint to ">= 7.1"). We test from 7.1 because that is what the code
+        # can actually run on. Note that shivammathur/setup-php does still list
+        # 7.0 as supported on GitHub-hosted runners, so 7.0 is excluded on the
+        # strength of the source, not of the tooling.
+        #
+        # The top of the range (8.3 / 8.4 / 8.5) matches what loqate-magento's CI
+        # covers, and 8.5 is the version that matters most: PHP 8.5 deprecated
+        # curl_close(), which is precisely the regression tests/no-deprecations.php
+        # was written to guard (LOQ-17709). The middle rungs are cheap (~1 min
+        # each) and this is a widely installed library, so we cover every PHP
+        # release a consumer could plausibly still be on rather than sampling.
+        php-version: ['7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          # Exactly the two extensions composer.json requires. ext-curl is a hard
+          # requirement of the library and the test aborts loudly without it
+          # (rather than passing vacuously). ext-json is core and always-on from
+          # PHP 8.0, but it is listed for parity with composer.json - setup-php
+          # no-ops on an extension that is already built in.
+          extensions: curl, json
+          # No coverage driver: there is nothing collecting coverage, and leaving
+          # Xdebug enabled (it is on by default on the Ubuntu images) makes every
+          # run slower for no benefit.
+          coverage: none
+          tools: composer:v2
+
+      # ----------------------------------------------------------------------
+      # Validate composer.json
+      # ----------------------------------------------------------------------
+      # Publish checks are left ON (no --no-check-publish, unlike loqate-magento
+      # which is not a Packagist package): this package IS published, so a broken
+      # "name" or a missing "description" should fail here rather than on
+      # Packagist.
+      #
+      # --no-check-lock is required: composer.lock in this repo is stale (its
+      # content-hash predates a composer.json edit) and `composer validate`
+      # treats that as an ERROR, exit code 2. The lock file is also meaningless
+      # for a library with zero dependencies - Composer resolves the consumer's
+      # tree, not ours. Fixing/removing it is a repo change, out of scope for
+      # this CI ticket; drop this flag once it is sorted.
+      #
+      # --strict is NOT used, and MUST NOT BE ADDED. Two reasons:
+      #   1. It would promote the "no license specified" warning to a failure.
+      #      Adding a license is a real follow-up, but not CI's call to make.
+      #   2. From the first release onwards, auto-tag.yml writes a "version"
+      #      field into composer.json. `composer validate` emits a general
+      #      warning for that ("The version field is present, it is recommended
+      #      to leave it out if the package is published on Packagist"). Verified
+      #      against a scratch copy: with the version field present,
+      #      `composer validate --no-check-lock` still exits 0 - the warning is
+      #      NOT fatal on its own, and --no-check-publish does NOT suppress it.
+      #      Under --strict it becomes exit 1 and every build after the first
+      #      release goes red.
+      - name: Validate composer.json
+        run: composer validate --no-check-lock
+
+      # ----------------------------------------------------------------------
+      # No Composer cache step - deliberate divergence from loqate-magento
+      # ----------------------------------------------------------------------
+      # loqate-magento caches ~/.composer/cache because it pulls the whole Magento
+      # framework. This package has ZERO entries in "require" beyond php/ext-*
+      # and no "require-dev" at all, so there is nothing to download: a cache
+      # restore + save would spend a few seconds and a cache-storage slot per
+      # matrix leg to move an empty directory. Adding actions/cache here would be
+      # cargo cult. If a require-dev (e.g. PHPUnit) is ever introduced, reinstate
+      # the cache step from loqate-magento's ci.yml at that point.
+
+      # ----------------------------------------------------------------------
+      # Verify the PSR-4 autoload map
+      # ----------------------------------------------------------------------
+      # There is no `composer install` step because there is nothing to install.
+      # We do generate the autoloader with --strict-psr, which fails if any class
+      # under src/ does not sit where its PSR-4 namespace says it should. That is
+      # the single most common way a zero-dependency library breaks for consumers
+      # while still passing its own tests (the test requires the file directly).
+      - name: Verify PSR-4 autoload mapping
+        run: composer dump-autoload --optimize --strict-psr
+
+      # ----------------------------------------------------------------------
+      # Run the suite
+      # ----------------------------------------------------------------------
+      # Via `composer test` (= `@php tests/no-deprecations.php`) so CI and local
+      # runs cannot drift. The script needs only a writable loopback interface
+      # and ext-curl; it never contacts api.addressy.com and needs no API key.
+      # It is POSIX-only by design, which is fine on ubuntu-latest.
+      #
+      # Note tests/ is marked export-ignore in .gitattributes, so it is stripped
+      # from the Packagist dist tarball - it exists to be run here, not shipped.
+      - name: Run tests
+        run: composer test
