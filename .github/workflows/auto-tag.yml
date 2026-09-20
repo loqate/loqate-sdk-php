@@ -1,0 +1,363 @@
+# ==============================================================================
+# Auto Tag and Release on Merge to Master
+# ==============================================================================
+# Replaces the manual "tag it and write a release by hand" step. On every push to
+# master (i.e. every merged PR) this workflow:
+#
+#   1. re-runs the test suite, and only if it is green,
+#   2. reads the conventional-commit messages since the last tag,
+#   3. bumps the "version" field in composer.json to the computed version and
+#      commits that back to master,
+#   4. creates the next semver tag ON that bump commit, and
+#   5. publishes a GitHub Release carrying the generated changelog.
+#
+# This intentionally MIRRORS the release mechanism in
+# /Projects/loqate-magento/.github/workflows/auto-tag.yml, step for step,
+# including the composer.json version bump, the RELEASE_TOKEN push to protected
+# master, the dry-run/custom_tag two-step and the infinite-loop guard. The two
+# repos are released the same way on purpose - if you change the mechanism here,
+# change it there too.
+#
+# Version bumping rules (Conventional Commits -> Semantic Versioning):
+#   feat: ...          -> MINOR bump (v1.1.3 -> v1.2.0)
+#   fix: ...           -> PATCH bump (v1.1.3 -> v1.1.4)
+#   BREAKING CHANGE:   -> MAJOR bump (v1.1.3 -> v2.0.0)
+#   anything else      -> NO tag, NO release (see default_bump below)
+#
+# Tag format: v{major}.{minor}.{patch} - the existing tags are v1.1.2 and v1.1.3,
+# and loqate-magento depends on "lqt/api-connector": "^1.1", so the 'v' prefix
+# and the semver line are both already load-bearing. Do not change them.
+#
+# Note on the version field: Packagist prefers to derive a package's version from
+# the git tag rather than from a "version" field in composer.json. This workflow
+# writes that field and the tag in the same job, from the same computed value, so
+# the two cannot drift apart.
+#
+# Not ported from loqate-magento: auto-release.yml's zip packaging. A Composer
+# library is consumed from the git tag via Packagist - `composer require
+# lqt/api-connector` resolves a tag and fetches the dist tarball GitHub generates
+# automatically - so a hand-built release asset would be an unused second copy.
+# (.gitattributes already marks /tests/ export-ignore, so that tarball is trimmed
+# for us.) The GitHub Release with its changelog, created at the end of this job,
+# is the endpoint.
+#
+# Side note for whoever extends this: the TAG is created with the default
+# GITHUB_TOKEN, and a ref created with that token does not start new workflow
+# runs. Fine as written, because the release is created here in the same job. But
+# a future workflow triggered by `on: push: tags:` or by `workflow_run` off this
+# one will silently never fire.
+# ==============================================================================
+
+name: Auto Tag and Release on Merge to Master
+
+# Trigger: runs automatically when code is pushed to master
+# (typically when a pull request is merged)
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  # ==========================================================================
+  # Job 1: Tests - gate the release on a green suite
+  # ==========================================================================
+  # Re-runs tests/no-deprecations.php (the same suite ci.yml runs on pull
+  # requests) on the merged state of master BEFORE any version bump, tag or
+  # release. The `tag` job below declares `needs: tests`, so if these fail no tag
+  # is created and no release is published - broken code never reaches Packagist.
+  #
+  # This job carries the SAME loop guard as the `tag` job so the bump commit does
+  # not trigger a wasted matrix run.
+  #
+  # The steps mirror the `tests` job in ci.yml exactly, including the PHP matrix.
+  # It is kept inline rather than calling ci.yml as a reusable workflow because
+  # ci.yml also triggers on `push: master` - calling it from here would run the
+  # whole matrix twice on every merge. THE TWO MATRICES MUST BE KEPT IN SYNC BY
+  # HAND; ci.yml carries the full reasoning for the version list, so change it
+  # there first.
+  tests:
+    name: Tests (PHP ${{ matrix.php-version }})
+    runs-on: ubuntu-latest
+
+    if: >-
+      ${{
+        !contains(github.event.head_commit.message, 'chore(release):') &&
+        !contains(github.event.head_commit.message, '[skip ci]')
+      }}
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ['7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: curl, json
+          coverage: none
+          tools: composer:v2
+
+      # --no-check-lock: composer.lock is stale and plain `composer validate`
+      # treats that as an ERROR (exit 2). Publish checks stay on, and they stay
+      # non-fatal once this workflow starts writing a "version" field - see the
+      # long-form note in ci.yml.
+      - name: Validate composer.json
+        run: composer validate --no-check-lock
+
+      - name: Verify PSR-4 autoload mapping
+        run: composer dump-autoload --optimize --strict-psr
+
+      - name: Run tests
+        run: composer test
+
+  # ==========================================================================
+  # Job 2: Bump composer.json, tag, and release
+  # ==========================================================================
+  tag:
+    name: Bump, tag and release
+    runs-on: ubuntu-latest
+
+    # Only tag/release once every leg of the matrix above is green.
+    needs: tests
+
+    # ------------------------------------------------------------------------
+    # INFINITE-LOOP GUARD (most important correctness concern in this file)
+    # ------------------------------------------------------------------------
+    # This job pushes a "chore(release): ..." commit back to master with
+    # RELEASE_TOKEN, which DOES re-trigger this `push: master` workflow. Unlike
+    # the default GITHUB_TOKEN - whose pushes are deliberately ignored by the
+    # trigger system precisely to prevent this - a PAT-authored push looks like
+    # any human push. Without a guard the workflow would run, bump, push, run,
+    # bump, push... forever, cutting a release every lap.
+    #
+    # We skip the job when the head commit message contains "chore(release):"
+    # (our own bump commit) or "[skip ci]".
+    #
+    # "[skip ci]" alone does NOT stop GitHub Actions - that token is honoured by
+    # some other CI systems, not by Actions - so this explicit `if:` is what
+    # actually breaks the loop. We check both tokens for defence in depth, and
+    # the bump commit message below deliberately carries both.
+    #
+    # DO NOT REMOVE THIS GUARD while the bump-and-push step exists. If you ever
+    # delete the push to master, delete the guard with it - not before.
+    if: >-
+      ${{
+        !contains(github.event.head_commit.message, 'chore(release):') &&
+        !contains(github.event.head_commit.message, '[skip ci]')
+      }}
+
+    # contents: write covers tag and release creation via the default
+    # GITHUB_TOKEN. The push to protected master is authenticated separately by
+    # RELEASE_TOKEN (see the checkout step) - that is an identity question, not a
+    # token-scope question, so no extra permission here helps with it.
+    permissions:
+      contents: write
+
+    steps:
+      # ----------------------------------------------------------------------
+      # Step 1: Checkout the repository with full git history
+      # ----------------------------------------------------------------------
+      # fetch-depth: 0 gives full history + tags, which the commit analysis below
+      # needs to find the previous tag and read every commit since it.
+      #
+      # We check out `master` by name because we commit the bump back to it, and
+      # we authenticate with RELEASE_TOKEN so the later push can get past the
+      # branch ruleset. actions/checkout persists this token in the local git
+      # config, so the `git push` in the bump step picks it up automatically -
+      # there is no second place to configure it.
+      #
+      # Why a custom token at all: master is covered by an active repository
+      # ruleset ("Base protections") that requires changes to go through a pull
+      # request. Rulesets gate on WHO pushes, not on token scope, so the default
+      # GITHUB_TOKEN / github-actions[bot] cannot push here even with
+      # `contents: write` - it is not on the ruleset's bypass list (which allows
+      # organisation admins and the repository Admin role). RELEASE_TOKEN is a
+      # PAT belonging to a user who IS on that list, so the push is attributed to
+      # them and the ruleset lets it through. No ruleset change is needed.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                      # Full history + tags
+          ref: master                         # We push the bump back here
+          token: ${{ secrets.RELEASE_TOKEN }} # Bypass-capable identity (admin PAT)
+
+      # Step 2: Belt-and-braces tag fetch. checkout does fetch tags with
+      # fetch-depth: 0, but a tag deleted and recreated upstream can leave a
+      # stale local ref, and the version calculation is only as good as the tags
+      # it can see.
+      - name: Fetch all tags
+        run: git fetch --force --tags
+
+      # Step 3: Record the starting point, for the log. If this is ever empty the
+      # next version is computed off v0.0.0 - worth seeing in the run output
+      # before wondering why.
+      - name: Get current latest tag
+        id: get_latest_tag
+        run: |
+          # Tags starting with 'v', sorted by version, highest first.
+          LATEST_TAG=$(git tag -l "v*" --sort=-v:refname | head -n 1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing tags found. Will start from v0.0.0"
+            echo "current_tag=v0.0.0" >> "$GITHUB_OUTPUT"
+          else
+            echo "Latest tag found: $LATEST_TAG"
+            echo "current_tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ----------------------------------------------------------------------
+      # Step 4: DRY RUN - compute the next version WITHOUT creating a tag
+      # ----------------------------------------------------------------------
+      # We compute the version first so we can bump composer.json and commit it
+      # BEFORE the real tag exists - which is what guarantees the tag points at a
+      # commit whose composer.json already carries the matching version.
+      #
+      # Outputs of interest (all empty when there is nothing to release):
+      #   new_tag      e.g. "v1.2.0" (with tag_prefix)
+      #   new_version  e.g. "1.2.0"  (without prefix) - what composer.json gets
+      #   changelog    conventional changelog since the previous tag
+      #   release_type major | minor | patch (for logging)
+      - name: Compute next version (dry run)
+        id: dry_run
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: false              # No feat/fix/BREAKING CHANGE commit -> no release at all.
+                                           # The action's own default is 'patch', which would cut a
+                                           # release on every merge, including docs/chore/CI-only ones.
+          release_branches: master         # Only master produces release tags
+          tag_prefix: v                    # Maintain the existing 'v' prefix (e.g. v1.1.3)
+          fetch_all_tags: true             # Fetch every tag, not just the last 100, so the
+                                           # "previous version" stays correct as the list grows
+          dry_run: true                    # IMPORTANT: do not create the tag yet
+          #
+          # `pre_release_branches` is intentionally NOT set (loqate-magento lists
+          # develop,beta). This repo releases from master only; naming branches
+          # that do not exist here would be misleading configuration.
+
+      # ----------------------------------------------------------------------
+      # Step 5: Bump composer.json and commit it to master
+      # ----------------------------------------------------------------------
+      # Only runs when the dry run computed a new version. We set the "version"
+      # field to the numeric version (no 'v' prefix) with jq, then commit and push
+      # to master using the RELEASE_TOKEN that checkout persisted.
+      #
+      # The commit message contains BOTH "chore(release):" and "[skip ci]" - the
+      # exact tokens the job-level `if:` guards check for - so the run this push
+      # triggers skips both jobs and the loop terminates. Changing this message
+      # without changing those guards will produce an infinite release loop.
+      #
+      # We record the resulting HEAD sha so the next step can tag exactly this
+      # commit rather than the commit that triggered the workflow.
+      - name: Bump composer.json version and commit
+        id: bump
+        if: steps.dry_run.outputs.new_version != ''
+        env:
+          NEW_TAG: ${{ steps.dry_run.outputs.new_tag }}
+          NEW_VERSION: ${{ steps.dry_run.outputs.new_version }}
+        run: |
+          echo "Setting composer.json version to: $NEW_VERSION"
+
+          # Rewrite the "version" field atomically via a temp file so a failure
+          # never leaves a half-written composer.json.
+          jq --arg v "$NEW_VERSION" '.version = $v' composer.json > composer.json.tmp
+          mv composer.json.tmp composer.json
+
+          echo "composer.json now reads:"
+          grep '"version"' composer.json
+
+          # Commit identity is cosmetic - the push is authenticated by
+          # RELEASE_TOKEN, and that is what determines ruleset bypass.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add composer.json
+
+          # Only commit if something actually changed (e.g. a re-run where
+          # composer.json already carries this version).
+          if git diff --cached --quiet; then
+            echo "composer.json already at $NEW_VERSION - nothing to commit."
+          else
+            git commit -m "chore(release): set composer.json version to ${NEW_TAG} [skip ci]"
+            git push origin master
+            echo "Pushed composer.json bump commit to master."
+          fi
+
+          # Either way, this is the commit the tag must land on.
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------------------
+      # Step 6: Create the REAL tag, on the bump commit
+      # ----------------------------------------------------------------------
+      # Two inputs here are doing load-bearing work:
+      #
+      #   custom_tag  - forces the exact version the dry run computed. Without it
+      #                 the action would re-analyse the commits, and it would now
+      #                 also see our new "chore(release): ..." commit, which can
+      #                 produce a different (higher) version than the one we just
+      #                 wrote into composer.json. custom_tag overrides all bump
+      #                 calculation. It takes the version WITHOUT the prefix; the
+      #                 action re-applies tag_prefix, so new_tag is still "v1.2.0".
+      #
+      #   commit_sha  - points the tag at the bump commit from step 5. The action
+      #                 otherwise tags GITHUB_SHA, which is the commit that
+      #                 TRIGGERED the run - i.e. the one before the bump - and the
+      #                 tag would then carry a composer.json without the version
+      #                 field. (loqate-magento's workflow omits this input; that
+      #                 is a latent bug there, not a convention to copy.)
+      - name: Create version tag
+        id: tag_version
+        if: steps.dry_run.outputs.new_version != ''
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag_prefix: v
+          fetch_all_tags: true
+          custom_tag: ${{ steps.dry_run.outputs.new_version }}  # Force the computed version
+          commit_sha: ${{ steps.bump.outputs.sha }}             # Tag the bump commit
+
+      # Step 7: Summarise in the log, whether or not anything was released - a
+      # run that correctly decided "no release" should say so out loud, otherwise
+      # it looks like a silent failure.
+      - name: Display version information
+        run: |
+          echo "========================================="
+          echo "Version bump summary"
+          echo "========================================="
+          echo "Previous tag:          ${{ steps.get_latest_tag.outputs.current_tag }}"
+          if [ -n "${{ steps.tag_version.outputs.new_tag }}" ]; then
+            echo "New tag created:       ${{ steps.tag_version.outputs.new_tag }}"
+            echo "Version bump type:     ${{ steps.dry_run.outputs.release_type }}"
+            echo "composer.json version: ${{ steps.dry_run.outputs.new_version }}"
+            echo "Tagged commit:         ${{ steps.bump.outputs.sha }}"
+          else
+            echo "New tag created:       (none - no feat:/fix:/BREAKING CHANGE commits since the last tag)"
+          fi
+          echo "========================================="
+
+      # ----------------------------------------------------------------------
+      # Step 8: Create a GitHub release with the changelog
+      # ----------------------------------------------------------------------
+      # Guarded on new_tag so a no-release run does not publish an empty release.
+      # The changelog comes from the dry run (the real tag step ran with
+      # custom_tag, so its own release_type is "custom" and it produces no
+      # changelog of its own).
+      #
+      # No `artifacts:` input - see the header on why a library ships no zip.
+      # Packagist picks up the TAG via its GitHub service hook, not the release.
+      - name: Create a GitHub release
+        uses: ncipollo/release-action@v1
+        if: steps.tag_version.outputs.new_tag != ''
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}          # The newly created tag
+          name: Release ${{ steps.tag_version.outputs.new_tag }} # Release title
+          body: ${{ steps.dry_run.outputs.changelog }}           # Auto-generated changelog
+          token: ${{ secrets.GITHUB_TOKEN }}
