@@ -92,6 +92,16 @@ jobs:
       fail-fast: false
       matrix:
         php-version: ['7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+        # Patched floors for CVE-2026-109618/109619 (LOQ-19163).
+        include:
+          - php-version: '8.2'
+            php-min: '8.2.35'
+          - php-version: '8.3'
+            php-min: '8.3.36'
+          - php-version: '8.4'
+            php-min: '8.4.27'
+          - php-version: '8.5'
+            php-min: '8.5.12'
 
     steps:
       - name: Checkout code
@@ -104,6 +114,19 @@ jobs:
           extensions: curl, json
           coverage: none
           tools: composer:v2
+        env:
+          # Pre-installed runner PHP is not patch-updated by default.
+          update: true
+
+      - name: Require patched PHP (CVE-2026-109618/109619, LOQ-19163)
+        env:
+          PHP_LEG: ${{ matrix.php-version }}
+          PHP_MIN: ${{ matrix.php-min }}
+        run: |
+          # 7.1-8.1 are EOL with no patched release; they stay to cover old-PHP consumers (tests only hit a loopback stub).
+          if php -r 'exit(version_compare(getenv("PHP_LEG"), "8.2", "<") ? 0 : 1);'; then echo "PHP $PHP_LEG is EOL; no patched release, skipping"; exit 0; fi
+          [ -n "$PHP_MIN" ] || { echo "::error::No php-min for PHP $PHP_LEG in the matrix include"; exit 1; }
+          php -r 'exit(version_compare(PHP_VERSION, getenv("PHP_MIN"), ">=") ? 0 : 1);' || { echo "::error::PHP $(php -r 'echo PHP_VERSION;') is below required $PHP_MIN"; exit 1; }
 
       # --no-check-lock: composer.lock is stale and plain `composer validate`
       # treats that as an ERROR (exit 2). Publish checks stay on, and they stay
