@@ -37,7 +37,7 @@ class API
      * @param $key
      * @return string|null
      */
-    public static function getEndpoint($key): ?string
+    public static function getEndpoint($key)
     {
         if (!isset(self::ENDPOINTS[$key])) {
             return null;

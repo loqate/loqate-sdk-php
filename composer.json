@@ -14,7 +14,10 @@
         }
     },
     "scripts": {
-        "test": "@php tests/no-deprecations.php"
+        "test": [
+            "@php tests/no-deprecations.php",
+            "@php tests/timeouts.php"
+        ]
     },
     "authors": [
         {
