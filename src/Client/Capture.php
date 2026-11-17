@@ -11,6 +11,9 @@ use Throwable;
  */
 class Capture
 {
+    /** @var int Seconds an interactive lookup may take before it gives up */
+    const TIMEOUT = 8;
+
     /** @var string ApiKey */
     private $apiKey;
 
@@ -39,7 +42,7 @@ class Capture
         $params['Key'] = $this->apiKey;
         $endpoint = API::getEndpoint('capture_find');
         try {
-            $response = $this->httpClient->get($endpoint, $params);
+            $response = $this->httpClient->get($endpoint, $params, self::TIMEOUT);
             if (isset($response['Items']) && $items = $response['Items']) {
                 return $items;
             }
@@ -88,7 +91,7 @@ class Capture
     public function processResponse($endpoint, $params)
     {
         try {
-            $response = $this->httpClient->get($endpoint, $params);
+            $response = $this->httpClient->get($endpoint, $params, self::TIMEOUT);
 
             if (isset($response['Items']) && $response['Items']) {
                 if (isset($response['Items'][0]['Error'])) {
