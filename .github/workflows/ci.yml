@@ -165,7 +165,10 @@ jobs:
       # under src/ does not sit where its PSR-4 namespace says it should. That is
       # the single most common way a zero-dependency library breaks for consumers
       # while still passing its own tests (the test requires the file directly).
+      # One leg is enough: the file layout is the same on every PHP, and the
+      # Composer that setup-php installs for 7.1 (2.2 LTS) has no --strict-psr.
       - name: Verify PSR-4 autoload mapping
+        if: matrix.php-version == '8.5'
         run: composer dump-autoload --optimize --strict-psr
 
       # ----------------------------------------------------------------------

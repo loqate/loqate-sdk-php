@@ -106,7 +106,9 @@ jobs:
       - name: Validate composer.json
         run: composer validate --no-check-lock
 
+      # One leg is enough (file layout, not PHP); Composer 2.2 on 7.1 has no --strict-psr.
       - name: Verify PSR-4 autoload mapping
+        if: matrix.php-version == '8.5'
         run: composer dump-autoload --optimize --strict-psr
 
       - name: Run tests
