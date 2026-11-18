@@ -4,17 +4,20 @@
 # Runs the library's regression suite on every pull request and on every push to
 # master.
 #
-# There is exactly one suite here, and it is not PHPUnit:
+# The suite is two standalone scripts, not PHPUnit:
 #
-#   tests/no-deprecations.php   A standalone script (LOQ-17709). It boots PHP's
-#                               built-in server on 127.0.0.1 as its own stub
-#                               Loqate endpoint, drives HttpClient::get() and
-#                               ::post() at it under an error handler that turns
-#                               ANY diagnostic into a failure, and asserts both
-#                               the clean path and the error-envelope throw.
+#   tests/no-deprecations.php   (LOQ-17709) Boots PHP's built-in server on
+#                               127.0.0.1 as a stub Loqate endpoint, drives
+#                               HttpClient::get() and ::post() at it under an
+#                               error handler that turns ANY diagnostic into a
+#                               failure, and asserts both the clean path and the
+#                               error-envelope throw.
+#   tests/timeouts.php          (LOQ-20337) Checks the connect and total time
+#                               limits against stub endpoints that never answer
+#                               or refuse the connection.
 #
-# It has no dependencies (no PHPUnit, no vendor/bin, nothing in require-dev), so
-# the whole job is: install PHP with ext-curl, run the script. It is invoked
+# They have no dependencies (no PHPUnit, no vendor/bin, nothing in require-dev),
+# so the whole job is: install PHP with ext-curl, run the scripts. They are invoked
 # through `composer test` so the command in CI is the same one a developer runs
 # locally - see the "scripts" block in composer.json.
 #
@@ -137,18 +140,9 @@ jobs:
       # tree, not ours. Fixing/removing it is a repo change, out of scope for
       # this CI ticket; drop this flag once it is sorted.
       #
-      # --strict is NOT used, and MUST NOT BE ADDED. Two reasons:
-      #   1. It would promote the "no license specified" warning to a failure.
-      #      Adding a license is a real follow-up, but not CI's call to make.
-      #   2. From the first release onwards, auto-tag.yml writes a "version"
-      #      field into composer.json. `composer validate` emits a general
-      #      warning for that ("The version field is present, it is recommended
-      #      to leave it out if the package is published on Packagist"). Verified
-      #      against a scratch copy: with the version field present,
-      #      `composer validate --no-check-lock` still exits 0 - the warning is
-      #      NOT fatal on its own, and --no-check-publish does NOT suppress it.
-      #      Under --strict it becomes exit 1 and every build after the first
-      #      release goes red.
+      # --strict is NOT used: it would promote the "no license specified"
+      # warning to a failure. Adding a license is a real follow-up, but not
+      # CI's call to make.
       - name: Validate composer.json
         run: composer validate --no-check-lock
 
@@ -177,12 +171,16 @@ jobs:
       # ----------------------------------------------------------------------
       # Run the suite
       # ----------------------------------------------------------------------
-      # Via `composer test` (= `@php tests/no-deprecations.php`) so CI and local
-      # runs cannot drift. The script needs only a writable loopback interface
-      # and ext-curl; it never contacts api.addressy.com and needs no API key.
-      # It is POSIX-only by design, which is fine on ubuntu-latest.
+      # Via `composer test` (both scripts above) so CI and local runs cannot
+      # drift. The scripts need only a loopback interface and ext-curl; they
+      # never contact api.addressy.com and need no API key. They are POSIX-only
+      # by design, which is fine on ubuntu-latest.
       #
       # Note tests/ is marked export-ignore in .gitattributes, so it is stripped
       # from the Packagist dist tarball - it exists to be run here, not shipped.
       - name: Run tests
-        run: composer test
+        run: |
+          set -o pipefail
+          composer test 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # tests/timeouts.php still exits 0 when it skips the connect-limit check (libcurl without TLS); here it must run.
+          if grep -q SKIPPED "$RUNNER_TEMP/test.log"; then echo "::error::A test check was SKIPPED on this runner"; exit 1; fi
