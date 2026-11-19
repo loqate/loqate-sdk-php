@@ -1,0 +1,175 @@
+# ==============================================================================
+# Auto Tag and Release on Merge to Master
+# ==============================================================================
+# On every push to master (every merged PR) this workflow:
+#
+#   1. re-runs the test suite, and only if it is green,
+#   2. reads the conventional-commit messages since the last tag,
+#   3. tags the merged commit with the next semver version, and
+#   4. publishes a GitHub Release carrying the generated changelog.
+#
+# Packagist reads the version from the git tag (composer.json has no "version"
+# field, as Packagist recommends) and picks the tag up through the repo's
+# Packagist webhook. Nothing is committed back to master, so the default
+# GITHUB_TOKEN is enough: the "Base protections" ruleset only covers the master
+# branch, not tags. No PAT, no bypass identity, no release-loop guard.
+#
+# Version bumping rules (Conventional Commits -> Semantic Versioning):
+#   feat: ...          -> MINOR bump (v1.1.4 -> v1.2.0)
+#   fix: ...           -> PATCH bump (v1.1.4 -> v1.1.5)
+#   BREAKING CHANGE:   -> MAJOR bump (v1.1.4 -> v2.0.0)
+#   anything else      -> NO tag, NO release (see default_bump below)
+#
+# Tag format: v{major}.{minor}.{patch}, matching the existing v1.1.2-v1.1.4.
+# loqate-magento depends on "lqt/api-connector": "^1.1.4", so the 'v' prefix and
+# the semver line are load-bearing. Do not change them.
+#
+# Not ported from loqate-magento: auto-release.yml's zip packaging. Composer
+# installs a library from the tag's dist tarball, which GitHub generates (and
+# .gitattributes trims /tests/ from), so a hand-built zip would be an unused copy.
+#
+# A tag created with GITHUB_TOKEN does not start other workflow runs, so a future
+# workflow on `push: tags:` would never fire. Repository webhooks (Packagist) are
+# not affected.
+# ==============================================================================
+
+name: Auto Tag and Release on Merge to Master
+
+on:
+  push:
+    branches:
+      - master
+
+# Two quick merges must not both compute the same next version.
+concurrency:
+  group: auto-tag
+  cancel-in-progress: false
+
+jobs:
+  # ==========================================================================
+  # Job 1: Tests - gate the release on a green suite
+  # ==========================================================================
+  # The `tag` job declares `needs: tests`, so a red leg means no tag and no
+  # release. The steps mirror the `tests` job in ci.yml exactly, including the
+  # PHP matrix. It is inline rather than a reusable call to ci.yml because ci.yml
+  # also runs on `push: master`. KEEP THE TWO IN SYNC BY HAND; ci.yml carries the
+  # reasoning for the version list, so change it there first.
+  tests:
+    name: Tests (PHP ${{ matrix.php-version }})
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php-version: ['7.1', '7.2', '7.3', '7.4', '8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+        # Patched floors for CVE-2026-109618/109619 (LOQ-19163).
+        include:
+          - php-version: '8.2'
+            php-min: '8.2.35'
+          - php-version: '8.3'
+            php-min: '8.3.36'
+          - php-version: '8.4'
+            php-min: '8.4.27'
+          - php-version: '8.5'
+            php-min: '8.5.12'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: curl, json
+          coverage: none
+          tools: composer:v2
+        env:
+          # Pre-installed runner PHP is not patch-updated by default.
+          update: true
+
+      - name: Require patched PHP (CVE-2026-109618/109619, LOQ-19163)
+        env:
+          PHP_LEG: ${{ matrix.php-version }}
+          PHP_MIN: ${{ matrix.php-min }}
+        run: |
+          # 7.1-8.1 are EOL with no patched release; they stay to cover old-PHP consumers (tests only hit a loopback stub).
+          if php -r 'exit(version_compare(getenv("PHP_LEG"), "8.2", "<") ? 0 : 1);'; then echo "PHP $PHP_LEG is EOL; no patched release, skipping"; exit 0; fi
+          [ -n "$PHP_MIN" ] || { echo "::error::No php-min for PHP $PHP_LEG in the matrix include"; exit 1; }
+          php -r 'exit(version_compare(PHP_VERSION, getenv("PHP_MIN"), ">=") ? 0 : 1);' || { echo "::error::PHP $(php -r 'echo PHP_VERSION;') is below required $PHP_MIN"; exit 1; }
+
+      # --no-check-lock: composer.lock is stale and plain `composer validate`
+      # treats that as an ERROR (exit 2). See the long-form note in ci.yml.
+      - name: Validate composer.json
+        run: composer validate --no-check-lock
+
+      # One leg is enough (file layout, not PHP); Composer 2.2 on 7.1 has no --strict-psr.
+      - name: Verify PSR-4 autoload mapping
+        if: matrix.php-version == '8.5'
+        run: composer dump-autoload --optimize --strict-psr
+
+      - name: Run tests
+        run: |
+          set -o pipefail
+          composer test 2>&1 | tee "$RUNNER_TEMP/test.log"
+          # tests/timeouts.php still exits 0 when it skips the connect-limit check (libcurl without TLS); here it must run.
+          if grep -q SKIPPED "$RUNNER_TEMP/test.log"; then echo "::error::A test check was SKIPPED on this runner"; exit 1; fi
+
+  # ==========================================================================
+  # Job 2: Tag and release
+  # ==========================================================================
+  tag:
+    name: Tag and release
+    runs-on: ubuntu-latest
+    needs: tests
+
+    # Creates the tag and the release with the default GITHUB_TOKEN.
+    permissions:
+      contents: write
+
+    steps:
+      # Full history + tags: the version calculation reads every commit since
+      # the previous tag.
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Tags GITHUB_SHA (the merged commit). Outputs are empty when there is
+      # nothing to release.
+      - name: Create version tag
+        id: tag_version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: false   # The action's own default is 'patch', which would release on every docs/chore/ci merge.
+          release_branches: master
+          tag_prefix: v
+          fetch_all_tags: true  # Not just the last 100 tags, so "previous version" stays right as the list grows.
+
+      # Say so out loud when nothing was released, so it does not look like a
+      # silent failure.
+      - name: Display version information
+        env:
+          NEW_TAG: ${{ steps.tag_version.outputs.new_tag }}
+          PREVIOUS_TAG: ${{ steps.tag_version.outputs.previous_tag }}
+          RELEASE_TYPE: ${{ steps.tag_version.outputs.release_type }}
+        run: |
+          echo "Previous tag: ${PREVIOUS_TAG:-(none)}"
+          if [ -n "$NEW_TAG" ]; then
+            echo "New tag:      $NEW_TAG ($RELEASE_TYPE)"
+          else
+            echo "New tag:      (none - no feat:/fix:/BREAKING CHANGE commits since the last tag)"
+          fi
+
+      - name: Create a GitHub release
+        uses: ncipollo/release-action@v1
+        if: steps.tag_version.outputs.new_tag != ''
+        with:
+          tag: ${{ steps.tag_version.outputs.new_tag }}
+          name: Release ${{ steps.tag_version.outputs.new_tag }}
+          body: ${{ steps.tag_version.outputs.changelog }}
+          token: ${{ secrets.GITHUB_TOKEN }}
