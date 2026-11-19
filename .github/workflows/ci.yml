@@ -19,6 +19,8 @@
 #                               responses through a spy HttpClient and asserts
 #                               only Valid/Invalid/Valid_CatchAll give a verdict;
 #                               Timeout and any other code give the error envelope.
+#                               (LOQ-20458) Also pins its responseCode key: a
+#                               plain word or '', and absent on failed requests.
 #
 # They have no dependencies (no PHPUnit, no vendor/bin, nothing in require-dev),
 # so the whole job is: install PHP with ext-curl, run the scripts. They are invoked
