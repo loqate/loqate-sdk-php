@@ -60,6 +60,10 @@ class Verify
     /**
      * Verify email address
      *
+     * Returns true/false only for a verdict (Valid, Invalid, Valid_CatchAll). Any other
+     * ResponseCode (e.g. Timeout) says nothing about the address, so it returns the
+     * ['error' => true, 'message' => ...] array, as transport failures do.
+     *
      * @param $params
      * @return array|bool
      */
@@ -72,11 +76,21 @@ class Verify
             $response = $this->httpClient->get($endpoint, $params);
 
             if (isset($response['Items']) && $item = reset($response['Items'])) {
-                if (isset($params[self::ACCEPT_VALID_CATCH_ALL])) {
-                    return $item['ResponseCode'] === self::VALID_CATCH_ALL || $item['ResponseCode'] === self::VALID;
+                $code = isset($item['ResponseCode']) ? $item['ResponseCode'] : '';
+
+                if ($code === self::VALID || $code === self::INVALID) {
+                    return $code === self::VALID;
                 }
 
-                return $item['ResponseCode'] === self::VALID;
+                if ($code === self::VALID_CATCH_ALL) {
+                    return isset($params[self::ACCEPT_VALID_CATCH_ALL]);
+                }
+
+                // json_encode(): an array code would warn if concatenated, and a newline in it could forge a log line.
+                return [
+                    'error' => true,
+                    'message' => 'Email verification returned no verdict (ResponseCode: ' . json_encode($code) . ').',
+                ];
             }
         } catch (Throwable $exception) {
             return ['error' => true, 'message' => $exception->getMessage()];
