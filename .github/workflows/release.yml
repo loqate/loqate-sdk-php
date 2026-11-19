@@ -1,0 +1,79 @@
+# ==============================================================================
+# Release from Tag
+# ==============================================================================
+# Creates the GitHub Release for a v* tag, with notes listing the commits since
+# the previous tag. Three ways in:
+#
+#   push: tags          a tag pushed by hand (as v1.1.2-v1.1.4 were).
+#   workflow_call       auto-tag.yml, for the tags it creates. A tag created with
+#                       GITHUB_TOKEN does not trigger `push: tags`, so auto-tag
+#                       calls this workflow directly.
+#   workflow_dispatch   Actions > Release from Tag > Run workflow, for a tag that
+#                       already exists but has no release.
+#
+# An existing release is left alone (skipIfReleaseExists), so running it twice
+# for one tag is harmless. No zip is attached: Composer installs from the tag's
+# dist tarball, which GitHub generates.
+# ==============================================================================
+
+name: Release from Tag
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_call:
+    inputs:
+      tag:
+        description: Tag to release, e.g. v1.1.5
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release, e.g. v1.1.4
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Release ${{ inputs.tag || github.ref_name }}
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # Full history + tags, for the notes below.
+
+      # On a tag push `inputs` is empty, so the tag comes from the ref.
+      - name: Write release notes
+        id: notes
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || { echo "::error::Tag $TAG does not exist"; exit 1; }
+          PREVIOUS=$(git tag -l 'v*' --sort=-v:refname | grep -A1 -xF "$TAG" | sed -n 2p)
+          {
+            echo "## Changes in $TAG"
+            echo
+            git log --no-merges --pretty=format:'- %s (%h)' "${PREVIOUS:+$PREVIOUS..}$TAG"
+            echo
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create the GitHub release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ steps.notes.outputs.tag }}
+          name: Release ${{ steps.notes.outputs.tag }}
+          bodyFile: ${{ runner.temp }}/notes.md
+          skipIfReleaseExists: true
+          token: ${{ secrets.GITHUB_TOKEN }}
