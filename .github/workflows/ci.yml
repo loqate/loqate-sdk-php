@@ -4,7 +4,7 @@
 # Runs the library's regression suite on every pull request and on every push to
 # master.
 #
-# The suite is two standalone scripts, not PHPUnit:
+# The suite is three standalone scripts, not PHPUnit:
 #
 #   tests/no-deprecations.php   (LOQ-17709) Boots PHP's built-in server on
 #                               127.0.0.1 as a stub Loqate endpoint, drives
@@ -15,6 +15,10 @@
 #   tests/timeouts.php          (LOQ-20337) Checks the connect and total time
 #                               limits against stub endpoints that never answer
 #                               or refuse the connection.
+#   tests/email-response-codes.php  (LOQ-20324) Feeds Verify::verifyEmail() canned
+#                               responses through a spy HttpClient and asserts
+#                               only Valid/Invalid/Valid_CatchAll give a verdict;
+#                               Timeout and any other code give the error envelope.
 #
 # They have no dependencies (no PHPUnit, no vendor/bin, nothing in require-dev),
 # so the whole job is: install PHP with ext-curl, run the scripts. They are invoked
@@ -174,7 +178,7 @@ jobs:
       # ----------------------------------------------------------------------
       # Run the suite
       # ----------------------------------------------------------------------
-      # Via `composer test` (both scripts above) so CI and local runs cannot
+      # Via `composer test` (all three scripts above) so CI and local runs cannot
       # drift. The scripts need only a loopback interface and ext-curl; they
       # never contact api.addressy.com and need no API key. They are POSIX-only
       # by design, which is fine on ubuntu-latest.

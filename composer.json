@@ -16,7 +16,8 @@
     "scripts": {
         "test": [
             "@php tests/no-deprecations.php",
-            "@php tests/timeouts.php"
+            "@php tests/timeouts.php",
+            "@php tests/email-response-codes.php"
         ]
     },
     "authors": [
